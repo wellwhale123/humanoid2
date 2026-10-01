@@ -29,6 +29,8 @@
  *   h               move all motors to 0 deg
  *   v <deg/s>       max speed (default 5, capped at MAX_SPEED_CAP_DPS)
  *   z <n>           set current position of motor n as zero (only while disabled)
+ *   t               direction test: each motor in turn (ID22 -> 23 -> 24 -> 25)
+ *                   moves +SWEEP_DEG and back. Enables automatically if needed.
  *   p               toggle status printing (10 Hz)
  *   ?               help
  *
@@ -66,10 +68,10 @@ struct MotorCfg
 // AK45-10: rated 2.5 Nm -> kp 2 Nm/rad gives ~0.17 Nm at 5 deg error
 MotorCfg cfg[NUM_MOTORS] = {
     // name        id  kp    kd    min    max   flip  v_max  t_max
-    {"AK45-36 #1",  1, 5.0f, 0.5f, -90.f, 90.f, false, 5.44f, 24.f},
-    {"AK45-36 #2",  2, 5.0f, 0.5f, -90.f, 90.f, false, 5.44f, 24.f},
-    {"AK45-36 #3",  3, 5.0f, 0.5f, -90.f, 90.f, false, 5.44f, 24.f},
-    {"AK45-10",     4, 2.0f, 0.2f, -90.f, 90.f, false, 18.85f, 7.f},
+    {"thigh  (ID22, AK45-36)", 22, 5.0f, 0.5f, -90.f, 90.f, false, 5.44f, 24.f},
+    {"ID23   (AK45-36)",       23, 5.0f, 0.5f, -90.f, 90.f, false, 5.44f, 24.f},
+    {"ID24   (AK45-36)",       24, 5.0f, 0.5f, -90.f, 90.f, false, 5.44f, 24.f},
+    {"foot   (ID25, AK45-10)", 25, 2.0f, 0.2f, -90.f, 90.f, false, 18.85f, 7.f},
 };
 
 const int   MOTOR_POWER_PIN    = -1;     // pin that switches motor power on your board, -1 = not used
@@ -81,6 +83,8 @@ const float ACCEL_DPS2         = 10.0f;  // smooth start/stop
 const float GAIN_RAMP_S        = 1.5f;   // gain ramp time on enable / soft disable
 const float MAX_TRACK_ERR_DEG  = 20.0f;  // measured vs setpoint, exceeded -> stop all
 const uint32_t REPLY_TIMEOUT_MS = 100;   // no reply while enabled -> stop all
+const float SWEEP_DEG          = 10.0f;  // direction test: visible but small
+const uint32_t SWEEP_PAUSE_MS  = 1500;   // pause at +SWEEP and after return
 // ===========================================================
 
 const float P_MAX = 12.5f, KP_MAX = 500.f, KD_MAX = 5.f;
@@ -105,6 +109,14 @@ float speed_dps = DEFAULT_SPEED_DPS;
 float gain_scale = 0.0f;
 uint32_t state_t0 = 0;
 bool print_on = true;
+
+// direction test sequence
+bool seq_pending = false;     // 't' sent while disabled -> start after enable
+bool seq_active = false;
+int seq_motor = 0;
+int seq_phase = 0;            // 0 go +, 1 pause, 2 return, 3 pause
+float seq_start_deg = 0;
+uint32_t seq_t = 0;
 
 // ---------------- packing ----------------
 static uint32_t f2u(float x, float lo, float hi, int bits)
@@ -180,6 +192,7 @@ static void stop_now(const char* why)
     for (int i = 0; i < NUM_MOTORS; i++) send_special(cfg[i].can_id, 0xFD);
     state = DISABLED;
     gain_scale = 0;
+    seq_active = seq_pending = false;
     Serial.print("!! STOP: ");
     Serial.println(why);
 }
@@ -260,11 +273,50 @@ static void step_setpoint(int i, float dt)
     rt[i].vel_dps = v;
 }
 
+// ---------------- direction test ----------------
+static bool arrived(int i)
+{
+    return rt[i].set_deg == rt[i].goal_deg && rt[i].vel_dps == 0;
+}
+
+static void seq_begin()
+{
+    seq_active = true; seq_pending = false;
+    seq_motor = 0; seq_phase = 0;
+    seq_start_deg = rt[0].goal_deg;
+    rt[0].goal_deg = constrain(seq_start_deg + SWEEP_DEG, cfg[0].min_deg, cfg[0].max_deg);
+    Serial.println("=== direction test start ===");
+    Serial.print(">> "); Serial.print(cfg[0].name); Serial.println(": moving + direction");
+}
+
+static void seq_update()
+{
+    if (!seq_active) return;
+    int i = seq_motor;
+    uint32_t now = millis();
+    switch (seq_phase)
+    {
+        case 0: if (arrived(i)) { seq_phase = 1; seq_t = now; Serial.println("   at +, pause (this was the + direction)"); } break;
+        case 1: if (now - seq_t >= SWEEP_PAUSE_MS) { rt[i].goal_deg = seq_start_deg; seq_phase = 2; Serial.println("   returning"); } break;
+        case 2: if (arrived(i)) { seq_phase = 3; seq_t = now; } break;
+        case 3:
+            if (now - seq_t < SWEEP_PAUSE_MS) break;
+            seq_motor++;
+            if (seq_motor >= NUM_MOTORS) { seq_active = false; Serial.println("=== direction test done ==="); break; }
+            i = seq_motor;
+            seq_start_deg = rt[i].goal_deg;
+            rt[i].goal_deg = constrain(seq_start_deg + SWEEP_DEG, cfg[i].min_deg, cfg[i].max_deg);
+            seq_phase = 0;
+            Serial.print(">> "); Serial.print(cfg[i].name); Serial.println(": moving + direction");
+            break;
+    }
+}
+
 // ---------------- serial ----------------
 static void help()
 {
     Serial.println("e enable | d soft disable | x STOP | g n deg | r n deg | a d1 d2 d3 d4 | h home");
-    Serial.println("v deg/s | z n (zero, disabled only) | p print on/off | ? help");
+    Serial.println("t direction test | v deg/s | z n (zero, disabled only) | p print on/off | ? help");
 }
 
 static void handle_line(char* s)
@@ -275,9 +327,20 @@ static void handle_line(char* s)
     char* tok = strtok(s + 1, " ,\t");
     while (tok && n < 4) { a[n++] = atof(tok); tok = strtok(NULL, " ,\t"); }
 
+    if (strchr("grahdx", c) && (seq_active || seq_pending))
+    {
+        seq_active = seq_pending = false;
+        Serial.println("direction test cancelled");
+    }
+
     switch (c)
     {
         case 'e': start_enable(); break;
+        case 't':
+            if (state == RUNNING) seq_begin();
+            else if (state == DISABLED) { if (start_enable()) seq_pending = true; }
+            else seq_pending = true;
+            break;
         case 'd':
             if (state == RUNNING || state == ENABLING) { state = DISABLING; state_t0 = millis(); Serial.println("soft disable..."); }
             break;
@@ -382,7 +445,7 @@ void loop()
     if (state == ENABLING)
     {
         gain_scale = ramp;
-        if (ramp >= 1.f) { state = RUNNING; Serial.println("running"); }
+        if (ramp >= 1.f) { state = RUNNING; Serial.println("running"); if (seq_pending) seq_begin(); }
     }
     else if (state == DISABLING)
     {
@@ -399,6 +462,7 @@ void loop()
         if (state == RUNNING && fabsf(rt[i].p_deg - rt[i].set_deg) > MAX_TRACK_ERR_DEG) { stop_now("tracking error"); Serial.println(cfg[i].name); return; }
     }
 
+    if (state == RUNNING) seq_update();
     for (int i = 0; i < NUM_MOTORS; i++)
     {
         if (state == RUNNING) step_setpoint(i, dt);
